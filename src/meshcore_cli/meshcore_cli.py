@@ -5,7 +5,7 @@
 
 import asyncio
 import os, sys, io, platform, shutil
-import string
+import string, hashlib
 import time, datetime
 import getopt, json, shlex, re
 import logging
@@ -728,6 +728,8 @@ def make_completion_dict(contacts, pending=None, to=None, channels=None):
         "apply_to": None,
         "at": None,
         "scope": None,
+        "secure_scope": SECURE_SCOPE_COMPLETION,
+        "sscope": SECURE_SCOPE_COMPLETION,
         "send_raw": None,
         "set" : {
             "name" : None,
@@ -816,6 +818,7 @@ def make_completion_dict(contacts, pending=None, to=None, channels=None):
         "?get":None,
         "?set":None,
         "?scope":None,
+        "?secure_scope":None,
         "?contact_info":None,
         "?apply_to":None,
         "?at":None,
@@ -891,6 +894,7 @@ def make_completion_dict(contacts, pending=None, to=None, channels=None):
         "req_clock" :None,
         "setperm":contact_list,
         "region" : {"get":None, "allowf": None, "denyf": None, "put": None, "remove": None, "save": None, "home": None},
+        "scope" : REPEATER_SCOPE_COMPLETION,
         "gps" : {"on":None,"off":None,"sync":None,"setloc":None,
             "advert" : {"none": None, "share": None, "prefs": None},
         },
@@ -1366,7 +1370,9 @@ async def process_line(mc, line, contact=None, scope="*", prev_contact=None, pre
 
     if line.startswith("/scope") or\
             line.startswith("scope") and contact is None:
-        if not scope is None:
+        if looks_like_repeater_scope_cmd(line.split()[1:]):
+            sink.write(REPEATER_SCOPE_HINT.format(line.split(" ", 1)[1]))
+        elif not scope is None:
             prev_scope = scope
             try:
                 newscope = line.split(" ", 1)[1]
@@ -2096,6 +2102,162 @@ async def set_scope (mc, scope) :
     return scope
 set_scope.has_scope = True
 set_scope.current_scope = None
+
+# ---------------- Secure scopes (S0 emergency, S1 admin, S2 private) ----------------
+# The companion signs the messages it floods with the scope's private key (CMD_SET_SECURE_SCOPE),
+# repeaters holding the matching public key ('scope key add' in repeater CLI) give them priority.
+
+CMD_SET_SECURE_SCOPE = 0x42
+RESP_CODE_SECURE_SCOPE = 0x1D
+SECURE_SCOPE_NAMES = ["emergency", "admin", "private"]
+
+# repeater cli 'scope' sub-commands, not to be taken as a flood scope (region) name
+REPEATER_SCOPE_SUBCMDS = ("key", "get", "airtime", "pool", "clear", "maxage", "stats")
+_SCOPE_IDS = {"S0": None, "S1": None, "S2": None}
+REPEATER_SCOPE_COMPLETION = {
+    "get": _SCOPE_IDS,
+    "key": {"add": _SCOPE_IDS, "del": _SCOPE_IDS, "list": _SCOPE_IDS},
+    "airtime": _SCOPE_IDS,
+    "pool": _SCOPE_IDS,
+    "maxage": None,
+    "clear": _SCOPE_IDS,
+    "stats": None,
+}
+SECURE_SCOPE_COMPLETION = {"status": None, "set": _SCOPE_IDS, "clear": None, "genkey": None}
+REPEATER_SCOPE_HINT = """'scope {}' looks like a repeater command (secure scopes), it was not sent.
+  - to configure a repeater : cmd <repeater> "scope ..."  (or 'to <repeater>' then 'scope ...')
+  - to set this companion's own secure scope key : secure_scope set S0 <keyfile>
+  - to set this companion's flood scope (region) : scope <region>
+"""
+
+def parse_secure_scope(s):
+    """ S0/S1/S2, 0/1/2 or emergency/admin/private -> index, None if unknown """
+    s = s.lower()
+    if len(s) == 2 and s[0] == "s" and s[1] in "012":
+        return int(s[1])
+    if s in ("0", "1", "2"):
+        return int(s)
+    if s in SECURE_SCOPE_NAMES:
+        return SECURE_SCOPE_NAMES.index(s)
+    return None
+
+def looks_like_repeater_scope_cmd(args):
+    """ args following 'scope': is it a repeater secure scope command (rather than a region name) ? """
+    if len(args) < 2 or args[0] not in REPEATER_SCOPE_SUBCMDS:
+        return False
+    return args[0] == "key" or parse_secure_scope(args[1]) is not None or args[1].isdigit()
+
+# Ed25519 public key from a MeshCore private key (64 bytes, orlp format: clamped scalar | prefix), RFC 8032
+_ED_P = 2**255 - 19
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+
+def _ed_add(P, Q):
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % _ED_P
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % _ED_P
+    C = 2 * P[3] * Q[3] * _ED_D % _ED_P
+    D = 2 * P[2] * Q[2] % _ED_P
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _ED_P, G * H % _ED_P, F * G % _ED_P, E * H % _ED_P)
+
+def ed25519_pub_from_prv(prv):
+    y = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P)
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * pow(2, (_ED_P - 1) // 4, _ED_P) % _ED_P
+    if x & 1:
+        x = _ED_P - x
+    B, Q = (x, y, 1, x * y % _ED_P), (0, 1, 1, 0)
+    s = int.from_bytes(prv[:32], "little")
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, B)
+        B = _ed_add(B, B)
+        s >>= 1
+    zinv = pow(Q[2], _ED_P - 2, _ED_P)
+    x, y = Q[0] * zinv % _ED_P, Q[1] * zinv % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+def new_scope_private_key():
+    """ same as ed25519_create_keypair() in firmware """
+    while True:
+        h = bytearray(hashlib.sha512(os.urandom(32)).digest())
+        h[0] &= 248
+        h[31] &= 63
+        h[31] |= 64
+        if ed25519_pub_from_prv(bytes(h))[0] not in (0x00, 0xFF): # reserved prefixes, rejected by firmware
+            return bytes(h)
+
+def load_scope_private_key(arg):
+    """ private key from 128 hex chars, or from a file containing them """
+    text = arg
+    path = os.path.expanduser(arg)
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
+    try:
+        prv = bytes.fromhex(text)
+    except ValueError:
+        raise ValueError(f"'{arg}' is neither a key file nor a 128 hex chars private key")
+    if len(prv) != 64:
+        raise ValueError(f"private key must be 64 bytes (128 hex chars), got {len(prv)} bytes")
+    return prv
+
+def secure_scope_frames(mc):
+    """ the meshcore lib doesn't know RESP_CODE_SECURE_SCOPE frames, catch them before its reader """
+    if getattr(mc, "_secure_scope_frames", None) is None:
+        frames = asyncio.Queue()
+        orig_handle_rx = mc._reader.handle_rx
+        async def handle_rx(data):
+            if len(data) > 0 and data[0] == RESP_CODE_SECURE_SCOPE:
+                frames.put_nowait(bytes(data))
+                return
+            await orig_handle_rx(data)
+        mc._reader.handle_rx = handle_rx
+        mc._secure_scope_frames = frames
+    return mc._secure_scope_frames
+
+async def get_secure_scope(mc, timeout=5):
+    """ returns companion's secure scope as a dict, None if not supported by firmware """
+    frames = secure_scope_frames(mc)
+    while not frames.empty():
+        frames.get_nowait()
+    await mc.commands.send(bytes([CMD_SET_SECURE_SCOPE]), None)
+    try:
+        frame = await asyncio.wait_for(frames.get(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+    if frame[1] >= len(SECURE_SCOPE_NAMES):
+        return {"scope": None}
+    res = {"scope": f"S{frame[1]}", "name": SECURE_SCOPE_NAMES[frame[1]], "public_key": frame[2:34].hex()}
+    if len(frame) >= 42:
+        res["signed"] = int.from_bytes(frame[34:38], "little")
+        res["too_big"] = int.from_bytes(frame[38:42], "little")
+    return res
+
+def format_secure_scope(res, end="\n"):
+    if res is None:
+        return f"Secure scopes not supported by this firmware{end}"
+    if res["scope"] is None:
+        return f"No secure scope, messages are not signed{end}"
+    s = f"Secure scope {res['scope']} ({res['name']}), public key {res['public_key']}{end}"
+    if "signed" in res:
+        s += f"  since boot: {res['signed']} msg(s) signed, {res['too_big']} too big to sign (sent without priority){end}"
+    return s
+
+async def set_secure_scope(mc, payload):
+    """ sends CMD_SET_SECURE_SCOPE, returns None on success, or an error string """
+    res = await mc.commands.send(payload, [EventType.OK, EventType.ERROR])
+    if res is None:
+        return "no response"
+    if res.type == EventType.ERROR:
+        code = res.payload.get("error_code") if isinstance(res.payload, dict) else None
+        if code == 1:
+            return "secure scopes not supported by this firmware"
+        if code == 6:
+            return "invalid scope or private key"
+        return f"error {res.payload}"
+    return None
 
 async def get_channel (mc, chan) :
     if not chan.isnumeric():
@@ -3123,9 +3285,64 @@ async def next_cmd(mc, cmds, json_output=False, sink=sys.stdout, end="\n"):
 
             case "scope":
                 argnum = 1
-                res = await set_scope(mc, cmds[1])
-                if res is None:
-                    output_str += f"Error while setting scope{end}"
+                if looks_like_repeater_scope_cmd(cmds[1:]):
+                    argnum = len(cmds) - 1   # don't run the remaining words as commands
+                    output_str += REPEATER_SCOPE_HINT.format(" ".join(cmds[1:]))
+                else:
+                    res = await set_scope(mc, cmds[1])
+                    if res is None:
+                        output_str += f"Error while setting scope{end}"
+
+            case "secure_scope" | "sscope":
+                subcmds = ("status", "set", "clear", "genkey")
+                sub = "status"
+                if len(cmds) > 1 and cmds[1] in subcmds:
+                    sub = cmds[1]
+                    argnum = 1
+                err = None
+                if sub == "genkey": # secure_scope genkey <file> : new private key, stays with the team
+                    argnum = 2
+                    path = os.path.expanduser(cmds[2])
+                    prv = new_scope_private_key()
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w") as f:
+                            f.write(prv.hex() + "\n")
+                    except FileExistsError:
+                        err = f"{path} already exists, not overwriting"
+                    if err is None:
+                        pub = ed25519_pub_from_prv(prv).hex()
+                        if json_output:
+                            output_str += json.dumps({"key_file": path, "public_key": pub}) + end
+                        else:
+                            output_str += f"Private key written to {path} (keep it secret){end}"
+                            output_str += f"Public key (for repeaters: scope key add S0 <key>): {pub}{end}"
+                else:
+                    if sub == "set": # secure_scope set <S0|S1|S2> <keyfile|hex>
+                        argnum = 3
+                        idx = parse_secure_scope(cmds[2])
+                        try:
+                            prv = load_scope_private_key(cmds[3])
+                        except (ValueError, OSError) as e:
+                            prv = None
+                            err = str(e)
+                        if idx is None:
+                            err = f"unknown scope {cmds[2]}, use S0, S1 or S2"
+                        elif prv is not None:
+                            err = await set_secure_scope(mc, bytes([CMD_SET_SECURE_SCOPE, idx]) + prv)
+                    elif sub == "clear":
+                        err = await set_secure_scope(mc, bytes([CMD_SET_SECURE_SCOPE, 0xFF]))
+                    if err is None:
+                        res = await get_secure_scope(mc)
+                        if json_output:
+                            output_str += json.dumps(res if res is not None else {"error": "not supported"}) + end
+                        else:
+                            output_str += format_secure_scope(res, end)
+                if err is not None:
+                    if json_output:
+                        output_str += json.dumps({"error": err}) + end
+                    else:
+                        output_str += f"Error: {err}{end}"
 
             case "reboot" :
                 res = await mc.commands.reboot()
@@ -4468,6 +4685,7 @@ def command_help():
     add_channel name [key] : add new channel with optional key
     remove_channel <n>     : remove channel (by number or name)
     scope <s>              : sets scope for flood messages
+    secure_scope <sub>     : companion's secure scope key (S0/S1/S2) sscope
   Management
     advert                 : sends advert                           a
     floodadv               : flood advert
@@ -4669,6 +4887,33 @@ Managing Flood Scope in interactive mode
     When default_scope is active, there is no scope showed on the prompt/
 
     Setting scope to "0" goes back to default scope. Setting scope to "*" forces messages to be sent unscoped.
+
+    Not to be confused with secure scopes (S0 emergency, S1 admin, S2 private):
+      - on repeaters, 'scope key add S0 ...' etc. are repeater commands: cmd <repeater> "scope ...", or 'to <repeater>' first
+      - on this companion, see ?secure_scope
+""")
+
+    elif cmdname == "secure_scope" or cmdname == "sscope":
+        print("""secure_scope <sub> : manages this companion's secure scope (alias sscope)
+
+    Secure scopes give messages priority and reserved capacity on repeaters: S0 (emergency), S1 (admin), S2 (private).
+    A scope is identified by a key pair: repeaters hold the public key, the team's companions hold the private key
+    and sign the messages they flood (direct msgs, channel msgs, channel data, logins).
+    Signed messages stay readable and forwardable by all firmware versions, and cost 80 bytes more.
+
+    secure_scope                         : shows scope, public key and counters (msgs signed / too big to sign)
+    secure_scope genkey <file>           : creates a new team private key in <file> (keep it secret), prints public key
+    secure_scope set <S0|S1|S2> <key>    : loads the private key (file, or 128 hex chars) into the companion
+    secure_scope clear                   : removes the key, messages are not signed anymore
+
+    Then, on each repeater (as admin) : cmd <repeater> "scope key add S0 <public key>"
+
+    Example :
+      meshcli secure_scope genkey ~/s0_team.key
+      meshcli secure_scope set S0 ~/s0_team.key
+      meshcli login MyRepeater <pwd> cmd MyRepeater "scope key add S0 <public key>" cmd MyRepeater "scope get S0"
+
+    Needs a companion firmware with secure scopes support.
 """)
 
     elif cmdname == "contact_info":
@@ -4911,6 +5156,7 @@ REPEATER_COMMANDS = {
     "gps": {"on": None, "off": None, "sync": None, "setloc": None, "advert": {"none": None, "share": None, "prefs": None}},
     "sensor": {"list": None, "get": None, "set": None},
     "region": {"get": None, "put": None, "remove": None, "save": None, "load": None, "home": None, "allowf": None, "denyf": None, "upload": None, "download": None},
+    "scope": REPEATER_SCOPE_COMPLETION,
     "setperm": None,
     "tempradio": None,
     "quit": None,
@@ -4970,6 +5216,19 @@ REPEATER_HELP = f"""
   region allowf      - gives flood permission to a region
   region denyf       - remove flood permission to a region
   region list        - list allowed/denied regions
+
+{ANSI_BGREEN}Secure scopes (S0 emergency, S1 admin, S2 private):{ANSI_END}
+  scope                         - show all scopes
+  scope get <S>                 - show a scope
+  scope key add <S> <pubkey>    - add a team's public key (64 hex chars)
+  scope key del <S> <prefix>    - remove a key
+  scope key list <S>            - list keys
+  scope airtime <S> <percent>   - reserve TX airtime for scope (total max 50%)
+  scope pool <S> <slots>        - reserve packet buffers for scope (total max 16)
+  scope maxage [<secs>]         - max age of signed messages (0: off)
+  scope clear <S>               - remove keys and reservations of a scope
+  scope stats                   - verified/rejected counters
+  (checks are logged with 'log start', see 'log')
 
 {ANSI_BGREEN}System:{ANSI_END}
   reboot              - Reboot device

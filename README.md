@@ -109,6 +109,7 @@ Commands are given after arguments, they can be chained and some have shortcuts.
     set_channel n nm k     : set channel info (nb, name, key)
     remove_channel &lt;n&gt;     : remove channel (by number or name)
     scope &lt;s&gt;              : sets node's flood scope
+    secure_scope &lt;sub&gt;     : companion's secure scope key (S0/S1/S2) sscope
   Management
     advert                 : sends advert                           a
     floodadv               : flood advert
@@ -193,6 +194,26 @@ When entering chat mode, scope will be set to "0" meaning default scope of the n
 You can switch scope using the `scope` command or postfixing the `to` command with `%<scope>`, this is a temporary scope that will be shown on the prompt. If you want to send unscoped message, do it by issuing `scope *`.
 
 Scope can also be applied to a command using `%` before the scope name. For instance `login%#Morbihan` will limit diffusion of the login command (which is usually sent flood to get the path to a repeater) to the `#Morbihan` region.
+
+#### Secure scopes
+
+Secure scopes (`S0` emergency, `S1` admin, `S2` private) give messages priority and reserved capacity (airtime, packet buffers) on repeaters. A scope is identified by a key pair: repeaters hold the public key, the team's companions hold the private key and sign the messages they flood. Needs firmware with secure scopes support, on both sides.
+
+On the companion:
+```
+secure_scope genkey ~/s0_team.key      # new team key, prints the public key (keep the file secret)
+secure_scope set S0 ~/s0_team.key      # load it into the companion (file, or 128 hex chars)
+secure_scope                           # scope, public key, msgs signed / too big to sign
+secure_scope clear                     # stop signing
+```
+
+On repeaters, `scope ...` is a repeater command (completion is available after `to <repeater>`, and in repeater mode `-r`):
+```
+login MyRepeater <pwd>
+cmd MyRepeater "scope key add S0 <public key>"
+cmd MyRepeater "scope get S0"
+```
+Typing a repeater secure scope command at the companion's prompt (`scope key add S0 ...`) is refused with a hint, rather than being taken as a region name.
 
 #### Channel echoes
 
